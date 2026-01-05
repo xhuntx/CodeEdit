@@ -1,6 +1,5 @@
-//  swiftlint:disable line_length
-//  swiftLint:disable file_length
-//  swiftlint:disable type_body_length
+// swiftlint:disable file_length
+
 //
 //  EditorAreaFileView.swift
 //  CodeEdit
@@ -17,6 +16,13 @@ import UniformTypeIdentifiers
 import Combine
 import Foundation
 import Darwin
+import os
+
+// Lightweight logger to replace `print` calls (avoids SwiftLint's print_usage warning)
+private let previewLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "CodeEdit",
+    category: "EditorPreview"
+)
 
 // MARK: - Display Modes
 enum EditorDisplayMode: String, CaseIterable, Identifiable {
@@ -39,7 +45,11 @@ struct HTMLRenderer {
     var loggingEnabled: Bool = false
 
     func renderHTML(from source: String) async -> String {
-        if loggingEnabled { print("[Preview] Rendering start. Source length: \(source.count)") }
+        if loggingEnabled {
+            previewLogger.debug(
+                "[Preview] Rendering start. Source length: \(source.count)"
+            )
+        }
         let output: String
         if let renderAsync {
             output = await renderAsync(source)
@@ -48,7 +58,11 @@ struct HTMLRenderer {
         } else {
             output = source
         }
-        if loggingEnabled { print("[Preview] Rendering done. HTML length: \(output.count)") }
+        if loggingEnabled {
+            previewLogger.debug(
+                "[Preview] Rendering done. HTML length: \(output.count)"
+            )
+        }
         return output
     }
 }
@@ -58,60 +72,98 @@ final class PreviewNavDelegate: NSObject, WKNavigationDelegate {
     var onCrash: (() -> Void)?
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        print("[WebView] WebContent process terminated")
+        previewLogger.warning("[WebView] WebContent process terminated")
         onCrash?()
     }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        print("[WebView] didFailProvisionalNavigation: \(error.localizedDescription)")
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        previewLogger.error(
+            "[WebView] didFailProvisionalNavigation: \(error.localizedDescription)"
+        )
         onCrash?()
     }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        print("[WebView] didFail navigation: \(error.localizedDescription)")
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        previewLogger.error(
+            "[WebView] didFail navigation: \(error.localizedDescription)"
+        )
     }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        print("[WebView] didFinish navigation. URL: \(webView.url?.absoluteString ?? "nil")")
+        previewLogger.debug(
+            "[WebView] didFinish navigation. URL: \(webView.url?.absoluteString ?? "nil")"
+        )
     }
 }
 
-// MARK: - WebView 
+// MARK: - WebView
 struct WebView: NSViewRepresentable {
     let html: String
     let baseURL: URL?
     let onCrash: () -> Void
     let allowJavaScript: Bool
 
-    class Coordinator {
+    final class Coordinator {
         let webView: WKWebView
         let navDelegate = PreviewNavDelegate()
-        var lastHTML: String = ""
-        var lastLoadAt: Date = .distantPast
+        private(set) var lastHTML: String = ""
+        private(set) var lastLoadAt: Date = .distantPast
+        var allowJavaScript: Bool
 
         init(onCrash: @escaping () -> Void, allowJavaScript: Bool) {
+            self.allowJavaScript = allowJavaScript
+
             let config = WKWebViewConfiguration()
-            config.preferences.javaScriptEnabled = allowJavaScript
             config.websiteDataStore = .default()
             config.suppressesIncrementalRendering = true
 
-            let wv = WKWebView(frame: .zero, configuration: config)
-            wv.setValue(false, forKey: "drawsBackground")
+            let webViewInstance = WKWebView(frame: .zero, configuration: config)
+            webViewInstance.setValue(false, forKey: "drawsBackground")
             navDelegate.onCrash = onCrash
-            wv.navigationDelegate = navDelegate
-            self.webView = wv
+            webViewInstance.navigationDelegate = navDelegate
+            self.webView = webViewInstance
         }
 
         func safeLoad(html: String, baseURL: URL?) {
             let now = Date()
-            if now.timeIntervalSince(lastLoadAt) < 1.0, lastHTML == html { return }
+            // Avoid redundant reloads
+            if now.timeIntervalSince(lastLoadAt) < 1.0, lastHTML == html {
+                return
+            }
             lastLoadAt = now
             lastHTML = html
+
+            if #available(macOS 11.0, *) {
+                webView.configuration.defaultWebpagePreferences.allowsContentJavaScript = allowJavaScript
+            } else {
+                // Fallback for older macOS versions: no action
+                // previewLogger.warning("[WebView] JavaScript enable/disable not supported on macOS < 11")
+            }
+
             webView.stopLoading()
             webView.loadHTMLString(html, baseURL: baseURL)
         }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(onCrash: onCrash, allowJavaScript: allowJavaScript) }
-    func makeNSView(context: Context) -> WKWebView { context.coordinator.webView }
-    func updateNSView(_ webView: WKWebView, context: Context) { context.coordinator.safeLoad(html: html, baseURL: baseURL) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCrash: onCrash, allowJavaScript: allowJavaScript)
+    }
+
+    func makeNSView(context: Context) -> WKWebView {
+        context.coordinator.webView
+    }
+
+    func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.safeLoad(html: html, baseURL: baseURL)
+    }
 }
 
 // MARK: - Markdown Renderer
@@ -153,38 +205,55 @@ struct ServerPreviewClient {
     let timeout: TimeInterval = 8
 
     func postHTML(_ html: String, filename: String?) async throws -> String {
-        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!
+        guard var components = URLComponents(
+            url: baseURL,
+            resolvingAgainstBaseURL: false
+        ) else {
+            throw URLError(.badURL)
+        }
         components.path = path
         guard let url = components.url else { throw URLError(.badURL) }
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = timeout
+
         let payload: [String: Any] = [
             "html": html,
             "filename": filename ?? "untitled.html",
             "timestamp": Date().timeIntervalSince1970
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
         let session = URLSession(configuration: configuration)
+
         let (respData, resp) = try await session.upload(for: request, from: data)
-        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        if !(200...299).contains(http.statusCode) {
+        guard let http = resp as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard (200...299).contains(http.statusCode) else {
             let bodyString = String(data: respData, encoding: .utf8) ?? ""
-            throw NSError(domain: "ServerPreview", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "Server preview failed (\(http.statusCode)).",
-                "body": bodyString
-            ])
+            throw NSError(
+                domain: "ServerPreview",
+                code: http.statusCode,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Server preview failed (\(http.statusCode)).",
+                    "body": bodyString
+                ]
+            )
         }
         return String(data: respData, encoding: .utf8) ?? ""
     }
 }
 
 extension Notification.Name {
-    static let CodeFileDocumentContentDidChange = Notification.Name("CodeFileDocumentContentDidChange")
+    static let CodeFileDocumentContentDidChange = Notification.Name(
+        "CodeFileDocumentContentDidChange"
+    )
 }
 
 // MARK: - Bottom Controls Overlay
@@ -236,70 +305,92 @@ struct PreviewBottomBar: View {
 
 // MARK: - Directory Watcher (helper)
 final class DirectoryWatcher {
-    private var fd: CInt = -1
+    private var fileDescriptor: CInt = -1
     private var source: DispatchSourceFileSystemObject?
     private let queue = DispatchQueue(label: "codeedit.filewatch.queue")
     private var lastEventAt: Date = .distantPast
     private let debounceInterval: TimeInterval = 0.25
 
-    func startWatching(url: URL, onChange: @escaping () -> Void, onError: @escaping (Error) -> Void) {
+    func startWatching(
+        url: URL,
+        onChange: @escaping () -> Void,
+        onError: @escaping (Error) -> Void
+    ) {
         stop()
 
         let dirURL = url.deletingLastPathComponent()
-        fd = open(dirURL.path, O_EVTONLY)
-        guard fd >= 0 else {
-            onError(NSError(domain: "DirectoryWatcher", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Failed to open directory: \(dirURL.path)"
-            ]))
+        fileDescriptor = open(dirURL.path, O_EVTONLY)
+        guard fileDescriptor >= 0 else {
+            onError(
+                NSError(
+                    domain: "DirectoryWatcher",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Failed to open directory: \(dirURL.path)"
+                    ]
+                )
+            )
             return
         }
 
-        let mask: DispatchSource.FileSystemEvent = [.write, .rename, .delete, .attrib, .extend]
-        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: mask, queue: queue)
+        let mask: DispatchSource.FileSystemEvent = [
+            .write, .rename, .delete, .attrib, .extend
+        ]
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileDescriptor,
+            eventMask: mask,
+            queue: queue
+        )
         source = src
 
         src.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let strongSelf = self else { return }
             let now = Date()
-            if now.timeIntervalSince(self.lastEventAt) < self.debounceInterval { return }
-            self.lastEventAt = now
+            if now.timeIntervalSince(strongSelf.lastEventAt) < strongSelf.debounceInterval {
+                return
+            }
+            strongSelf.lastEventAt = now
             onChange() // caller hops to main if needed
         }
 
         src.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.fd >= 0 { close(self.fd) }
-            self.fd = -1
-            self.source = nil
+            guard let strongSelf = self else { return }
+            if strongSelf.fileDescriptor >= 0 { close(strongSelf.fileDescriptor) }
+            strongSelf.fileDescriptor = -1
+            strongSelf.source = nil
         }
 
         src.resume()
-        print("[FS Watch] Started for directory: \(dirURL.path)")
+        previewLogger.debug("[FS Watch] Started for directory: \(dirURL.path)")
     }
 
     func stop() {
         source?.cancel()
         source = nil
-        if fd >= 0 { close(fd) }
-        fd = -1
+        if fileDescriptor >= 0 { close(fileDescriptor) }
+        fileDescriptor = -1
     }
 
     deinit { stop() }
 }
 
 // MARK: - Main View
+// swiftlint:disable:next type_body_length
 struct EditorAreaFileView: View {
     @EnvironmentObject private var editorManager: EditorManager
     @EnvironmentObject private var editor: Editor
     @EnvironmentObject private var statusBarViewModel: StatusBarViewModel
-    @Environment(\.edgeInsets) private var edgeInsets
+    @Environment(\.edgeInsets)
+    private var edgeInsets
 
     var editorInstance: EditorInstance
     var codeFile: CodeFileDocument
 
     var htmlRenderer: HTMLRenderer = .init(
         render: { source in
-            let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let trimmed = source
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
             let looksHTML = trimmed.hasPrefix("<!doctype") || trimmed.hasPrefix("<html")
             if looksHTML { return source }
             let escaped = source
@@ -313,8 +404,14 @@ struct EditorAreaFileView: View {
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <style>
-                  html, body { margin: 0; padding: 0; background: #ffffff; color: #111; font: -apple-system-body; }
-                  pre { white-space: pre-wrap; word-wrap: break-word; margin: 0; padding: 16px; }
+                  html, body {
+                    margin: 0; padding: 0; background: #ffffff;
+                    color: #111; font: -apple-system-body;
+                  }
+                  pre {
+                    white-space: pre-wrap; word-wrap: break-word;
+                    margin: 0; padding: 16px;
+                  }
                   h1, h2, h3, p { margin-top: 0; }
                 </style>
               </head>
@@ -324,6 +421,7 @@ struct EditorAreaFileView: View {
         },
         loggingEnabled: true
     )
+
     var enablePreviewLogging: Bool = true
 
     @State private var renderedHTMLState: String = ""
@@ -352,8 +450,8 @@ struct EditorAreaFileView: View {
     @State private var dragStartPreviewWidth: CGFloat?
 
     // Min/max constraints for width-only resizing
-    private let MIN_PREVIEW_WIDTH: CGFloat = 200
-    private let MAX_PREVIEW_WIDTH: CGFloat = 1400
+    private let minPreviewWidth: CGFloat = 200
+    private let maxPreviewWidth: CGFloat = 1400
 
     private func bindContent() {
         NotificationCenter.default.publisher(
@@ -373,7 +471,9 @@ struct EditorAreaFileView: View {
         renderWorkItem?.cancel()
         let work = DispatchWorkItem {
             Task { @MainActor in
-                if enablePreviewLogging { print("[Preview] Source changed. Rendering…") }
+                if enablePreviewLogging {
+                    previewLogger.debug("[Preview] Source changed. Rendering…")
+                }
                 switch previewSource {
                 case .localHTML:
                     let html = await htmlRenderer.renderHTML(from: source)
@@ -381,15 +481,19 @@ struct EditorAreaFileView: View {
                     if renderedHTMLState != html {
                         renderedHTMLState = html
                         webViewRefreshToken = UUID()
-                        print("[Preview] Local HTML set. length: \(html.count)")
+                        previewLogger.debug(
+                            "[Preview] Local HTML set. length: \(html.count)"
+                        )
                     } else {
-                        print("[Preview] No state change (same HTML)")
+                        previewLogger.debug("[Preview] No state change (same HTML)")
                     }
                 case .serverPreview:
                     let localHTML = await htmlRenderer.renderHTML(from: source)
                     if renderedHTMLState != localHTML {
                         renderedHTMLState = localHTML
-                        print("[Preview] Fallback local HTML set. length: \(localHTML.count)")
+                        previewLogger.debug(
+                            "[Preview] Fallback local HTML set. length: \(localHTML.count)"
+                        )
                     }
                     await loadServerPreview(with: source)
                 }
@@ -407,24 +511,32 @@ struct EditorAreaFileView: View {
             let serverHTML = try await serverClient.postHTML(source, filename: filename)
             if renderedHTMLState != serverHTML {
                 renderedHTMLState = serverHTML
-                print("[Preview] Server HTML set. length: \(serverHTML.count)")
+                previewLogger.debug(
+                    "[Preview] Server HTML set. length: \(serverHTML.count)"
+                )
             } else {
-                print("[Preview] Server returned identical HTML; no state change.")
+                previewLogger.debug(
+                    "[Preview] Server returned identical HTML; no state change."
+                )
             }
         } catch {
             let message: String
             if let urlError = error as? URLError {
                 switch urlError.code {
-                case .cannotFindHost: message = "Cannot find server at localhost:3000."
-                case .timedOut: message = "Server preview timed out."
-                case .notConnectedToInternet: message = "No network connection."
-                default: message = "Network error: \(urlError.localizedDescription)"
+                case .cannotFindHost:
+                    message = "Cannot find server at localhost:3000."
+                case .timedOut:
+                    message = "Server preview timed out."
+                case .notConnectedToInternet:
+                    message = "No network connection."
+                default:
+                    message = "Network error: \(urlError.localizedDescription)"
                 }
             } else {
                 message = error.localizedDescription
             }
             serverErrorMessage = message
-            print("[Preview] Server preview error: \(message)")
+            previewLogger.error("[Preview] Server preview error: \(message)")
         }
     }
 
@@ -436,7 +548,7 @@ struct EditorAreaFileView: View {
     }
 
     private func refreshPreview() {
-        print("[Preview] Manual refresh triggered")
+        previewLogger.debug("[Preview] Manual refresh triggered")
         scheduleRender(for: contentString)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             webViewRefreshToken = UUID()
@@ -448,11 +560,15 @@ struct EditorAreaFileView: View {
         guard let fileURL = codeFile.fileURL else { return }
 
         // Record current mtime to filter unrelated directory events
-        lastKnownFileMTime = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        lastKnownFileMTime = (try? fileURL.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ))?.contentModificationDate
 
         watcher.startWatching(url: fileURL) { [fileURL] in
             // Compute new mtime off the main thread
-            let mtime = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            let mtime = (try? fileURL.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ))?.contentModificationDate
 
             // Hop to main to mutate state and refresh UI
             DispatchQueue.main.async {
@@ -467,7 +583,9 @@ struct EditorAreaFileView: View {
                         let newText = String(data: data, encoding: .utf8) ?? ""
                         self.updatePreview(with: newText)
                     } catch {
-                        print("[FS Watch] Failed reading file: \(error.localizedDescription)")
+                        previewLogger.error(
+                            "[FS Watch] Failed reading file: \(error.localizedDescription)"
+                        )
                     }
                 }
 
@@ -475,7 +593,7 @@ struct EditorAreaFileView: View {
             }
         } onError: { err in
             DispatchQueue.main.async {
-                print("[FS Watch] Error: \(err.localizedDescription)")
+                previewLogger.error("[FS Watch] Error: \(err.localizedDescription)")
             }
         }
     }
@@ -487,8 +605,10 @@ struct EditorAreaFileView: View {
     // MARK: - Layout
     @ViewBuilder var editorAreaFileView: some View {
         let pathExt = codeFile.fileURL?.pathExtension.lowercased() ?? ""
-        let isHTML = (codeFile.utType?.conforms(to: .html) ?? false) || (["html", "htm"].contains(pathExt))
-        let isMarkdown = (codeFile.utType?.identifier == "net.daringfireball.markdown") || (pathExt == "md" || pathExt == "markdown")
+        let isHTML = (codeFile.utType?.conforms(to: .html) ?? false)
+            || (["html", "htm"].contains(pathExt))
+        let isMarkdown = (codeFile.utType?.identifier == "net.daringfireball.markdown")
+            || (pathExt == "md" || pathExt == "markdown")
 
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -512,17 +632,30 @@ struct EditorAreaFileView: View {
                 // give a larger transparent hit area so it is easy to grab
                 .padding(.horizontal, 6)
                 .contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 1).onChanged { value in
-                    if dragStartPreviewWidth == nil { dragStartPreviewWidth = previewWidth }
-                    let start = dragStartPreviewWidth ?? previewWidth
-                    let delta = value.location.x - value.startLocation.x
-                    let newW = start - delta
-                    previewWidth = max(MIN_PREVIEW_WIDTH, min(MAX_PREVIEW_WIDTH, newW))
-                }.onEnded { _ in
-                    dragStartPreviewWidth = nil
-                })
+                .gesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { value in
+                            if dragStartPreviewWidth == nil {
+                                dragStartPreviewWidth = previewWidth
+                            }
+                            let start = dragStartPreviewWidth ?? previewWidth
+                            let delta = value.location.x - value.startLocation.x
+                            let newW = start - delta
+                            previewWidth = max(
+                                minPreviewWidth,
+                                min(maxPreviewWidth, newW)
+                            )
+                        }
+                        .onEnded { _ in
+                            dragStartPreviewWidth = nil
+                        }
+                )
                 .onHover { hovering in
-                    if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                    if hovering {
+                        NSCursor.resizeLeftRight.push()
+                    } else {
+                        NSCursor.pop()
+                    }
                 }
 
             if isHTML {
@@ -536,14 +669,22 @@ struct EditorAreaFileView: View {
                             ZStack {
                                 WebView(
                                     html: renderedHTMLState.isEmpty
-                                        ? "<!doctype html><html><body style='background:#fff'><h1>Preview Ready</h1></body></html>"
+                                        ? """
+                                          <!doctype html><html><body style='background:#fff'>
+                                          <h1>Preview Ready</h1>
+                                          </body></html>
+                                          """
                                         : renderedHTMLState,
                                     baseURL: codeFile.fileURL?.deletingLastPathComponent(),
                                     onCrash: { /* WebKit always on; show message if needed */ },
                                     allowJavaScript: webViewAllowJS
                                 )
                                 .id(webViewRefreshToken)
-                                .frame(maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
+                                .frame(
+                                    maxWidth: .infinity,
+                                    minHeight: 320,
+                                    maxHeight: .infinity
+                                )
                                 // ensure top safe area isn't covered — add top padding to push web content down
                                 .padding(.top, edgeInsets.top)
                                 .background(Color.white)
@@ -640,14 +781,22 @@ struct EditorAreaFileView: View {
                             ZStack {
                                 WebView(
                                     html: renderedHTMLState.isEmpty
-                                        ? "<!doctype html><html><body style='background:#fff'><h1>Preview Ready</h1></body></html>"
+                                        ? """
+                                          <!doctype html><html><body style='background:#fff'>
+                                          <h1>Preview Ready</h1>
+                                          </body></html>
+                                          """
                                         : renderedHTMLState,
                                     baseURL: codeFile.fileURL?.deletingLastPathComponent(),
                                     onCrash: { /* WebKit always on */ },
                                     allowJavaScript: webViewAllowJS
                                 )
                                 .id(webViewRefreshToken)
-                                .frame(maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
+                                .frame(
+                                    maxWidth: .infinity,
+                                    minHeight: 320,
+                                    maxHeight: .infinity
+                                )
                                 // push content below top chrome so h1 isn't cut off
                                 .padding(.top, edgeInsets.top)
                                 .background(Color.white)
@@ -698,7 +847,11 @@ struct EditorAreaFileView: View {
                         VStack(spacing: 0) {
                             ZStack {
                                 MarkdownView(source: contentString)
-                                    .frame(maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
+                                    .frame(
+                                        maxWidth: .infinity,
+                                        minHeight: 320,
+                                        maxHeight: .infinity
+                                    )
                                     .padding(.top, edgeInsets.top)
                                     .background(Color.white)
 
@@ -763,6 +916,7 @@ struct EditorAreaFileView: View {
                             CodeFileView(editorInstance: editorInstance, codeFile: codeFile)
 
                             if !showPreviewPane {
+                                // overlay button to restore preview
                                 Button {
                                     withAnimation(.easeInOut(duration: 0.18)) {
                                         showPreviewPane = true
@@ -790,7 +944,11 @@ struct EditorAreaFileView: View {
                             VStack(spacing: 0) {
                                 ZStack {
                                     MarkdownView(source: contentString)
-                                        .frame(maxWidth: .infinity, minHeight: 320, maxHeight: .infinity)
+                                        .frame(
+                                            maxWidth: .infinity,
+                                            minHeight: 320,
+                                            maxHeight: .infinity
+                                        )
                                         .padding(.top, edgeInsets.top)
                                         .background(Color.white)
 
@@ -824,10 +982,13 @@ struct EditorAreaFileView: View {
                                     .zIndex(10)
                                 }
                             }
-                            .frame(minWidth: previewWidth,
-                                   idealWidth: previewWidth,
-                                   maxWidth: previewWidth,
-                                   maxHeight: .infinity, alignment: .center)
+                            .frame(
+                                minWidth: previewWidth,
+                                idealWidth: previewWidth,
+                                maxWidth: previewWidth,
+                                maxHeight: .infinity,
+                                alignment: .center
+                            )
                             .background(Color.white)
                         }
                     }
@@ -855,7 +1016,9 @@ struct EditorAreaFileView: View {
                 serverErrorMessage = nil
                 if renderedHTMLState != html {
                     renderedHTMLState = html
-                    print("[Preview] Initial set. html length: \(html.count)")
+                    previewLogger.debug(
+                        "[Preview] Initial set. html length: \(html.count)"
+                    )
                 }
                 if previewSource == .serverPreview {
                     await loadServerPreview(with: sourceString)
@@ -877,7 +1040,11 @@ struct EditorAreaFileView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onHover { hover in
                 DispatchQueue.main.async {
-                    if hover { NSCursor.iBeam.push() } else { NSCursor.pop() }
+                    if hover {
+                        NSCursor.iBeam.push()
+                    } else {
+                        NSCursor.pop()
+                    }
                 }
             }
     }
