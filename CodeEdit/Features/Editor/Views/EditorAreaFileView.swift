@@ -453,6 +453,10 @@ struct EditorAreaFileView: View {
     private let minPreviewWidth: CGFloat = 200
     private let maxPreviewWidth: CGFloat = 1400
 
+    // Key event monitor for toggling preview via keyboard shortcut
+    // Shortcut: Command + Option + P
+    @State private var keyEventMonitor: Any?
+
     private func bindContent() {
         NotificationCenter.default.publisher(
             for: .CodeFileDocumentContentDidChange,
@@ -737,7 +741,7 @@ struct EditorAreaFileView: View {
                                     .clipShape(Circle())
                             }
                             .buttonStyle(.plain)
-                            .help("Show Preview")
+                            .help("Show Preview (⌘⌥P)")
                             Spacer()
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -764,7 +768,7 @@ struct EditorAreaFileView: View {
                                         .clipShape(Circle())
                                 }
                                 .buttonStyle(.plain)
-                                .help("Show Preview")
+                                .help("Show Preview (⌘⌥P)")
                                 .padding(.top, edgeInsets.top + 8)
                                 .padding(.trailing, 8)
                                 .zIndex(10)
@@ -825,7 +829,7 @@ struct EditorAreaFileView: View {
                                         .clipShape(Circle())
                                 }
                                 .buttonStyle(.plain)
-                                .help("Hide Preview")
+                                .help("Hide Preview (⌘⌥P)")
                                 .padding(.top, edgeInsets.top + 8)
                                 .padding(.trailing, 8)
                                 .zIndex(10)
@@ -879,7 +883,7 @@ struct EditorAreaFileView: View {
                                         .clipShape(Circle())
                                 }
                                 .buttonStyle(.plain)
-                                .help("Hide Preview")
+                                .help("Hide Preview (⌘⌥P)")
                                 .padding(.top, edgeInsets.top + 8)
                                 .padding(.trailing, 8)
                                 .zIndex(10)
@@ -902,7 +906,7 @@ struct EditorAreaFileView: View {
                                     .clipShape(Circle())
                             }
                             .buttonStyle(.plain)
-                            .help("Show Preview")
+                            .help("Show Preview (⌘⌥P)")
                             Spacer()
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -929,7 +933,7 @@ struct EditorAreaFileView: View {
                                         .clipShape(Circle())
                                 }
                                 .buttonStyle(.plain)
-                                .help("Show Preview")
+                                .help("Show Preview (⌘⌥P)")
                                 .padding(.top, edgeInsets.top + 8)
                                 .padding(.trailing, 8)
                                 .zIndex(10)
@@ -976,7 +980,7 @@ struct EditorAreaFileView: View {
                                             .clipShape(Circle())
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Hide Preview")
+                                    .help("Hide Preview (⌘⌥P)")
                                     .padding(.top, edgeInsets.top + 8)
                                     .padding(.trailing, 8)
                                     .zIndex(10)
@@ -1025,6 +1029,22 @@ struct EditorAreaFileView: View {
                 }
             }
             startFileWatchIfNeeded()
+
+            // Install key event monitor for toggling preview (⌘ + ⌥ + P)
+            keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                let chars = event.charactersIgnoringModifiers?.lowercased()
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                if chars == "p" && flags.contains(.command) && flags.contains(.option) {
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            showPreviewPane.toggle()
+                        }
+                    }
+                    // swallow the event so other handlers don't also process it
+                    return nil
+                }
+                return event
+            }
         }
         .onChange(of: codeFile.fileURL) { _ in
             stopFileWatch()
@@ -1032,6 +1052,10 @@ struct EditorAreaFileView: View {
         }
         .onDisappear {
             stopFileWatch()
+            if let monitor = keyEventMonitor {
+                NSEvent.removeMonitor(monitor)
+                keyEventMonitor = nil
+            }
         }
     }
 
